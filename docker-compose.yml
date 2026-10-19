@@ -1,0 +1,196 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: gefe-postgres
+    environment:
+      POSTGRES_DB: gefe_db
+      POSTGRES_USER: gefe_user
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/migrations:/docker-entrypoint-initdb.d
+    ports:
+      - "5432:5432"
+    networks:
+      - gefe_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gefe_user"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Qdrant Vector Database
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: gefe-qdrant
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    networks:
+      - gefe_network
+    command: ['--cluster-enabled', 'true']
+
+  # Kafka Message Broker
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: gefe-kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+      "29092:29092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+    networks:
+      - gefe_network
+
+  # Zookeeper
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: gefe-zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    networks:
+      - gefe_network
+
+  # Backend API
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: gefe-backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_started
+    environment:
+      DATABASE_URL: postgresql://gefe_user:${DB_PASSWORD}@postgres:5432/gefe_db
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      QDRANT_URL: http://qdrant:6333
+      REDIS_URL: redis://redis:6379
+      ENVIRONMENT: development
+    ports:
+      - "8000:8000"
+    networks:
+      - gefe_network
+    restart: unless-stopped
+
+  # Data Pipeline
+  data-pipeline:
+    build:
+      context: ./data_pipeline
+      dockerfile: Dockerfile
+    container_name: gefe-data-pipeline
+    depends_on:
+      - kafka
+      - postgres
+      - qdrant
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      DATABASE_URL: postgresql://gefe_user:${DB_PASSWORD}@postgres:5432/gefe_db
+      QDRANT_URL: http://qdrant:6333
+    networks:
+      - gefe_network
+    restart: unless-stopped
+
+  # AI Model Serving
+  ai-models:
+    build:
+      context: ./ai_models
+      dockerfile: Dockerfile
+    container_name: gefe-ai-models
+    depends_on:
+      - backend
+      - postgres
+    environment:
+      DATABASE_URL: postgresql://gefe_user:${DB_PASSWORD}@postgres:5432/gefe_db
+      QDRANT_URL: http://qdrant:6333
+      CUDA_VISIBLE_DEVICES: 0
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    networks:
+      - gefe_network
+    restart: unless-stopped
+
+  # Frontend Dashboard
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: gefe-frontend
+    depends_on:
+      - backend
+    ports:
+      - "3000:3000"
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8000
+      NEXT_PUBLIC_WS_URL: ws://localhost:8000/ws
+    networks:
+      - gefe_network
+    restart: unless-stopped
+
+  # Redis Cache
+  redis:
+    image: redis:7-alpine
+    container_name: gefe-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - gefe_network
+    command: redis-server --appendonly yes
+
+  # Monitoring Stack
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: gefe-prometheus
+    volumes:
+      - ./infra/docker/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    networks:
+      - gefe_network
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: gefe-grafana
+    depends_on:
+      - prometheus
+    ports:
+      - "3001:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD}
+    volumes:
+      - grafana_data:/var/lib/grafana
+    networks:
+      - gefe_network
+
+volumes:
+  postgres_data:
+  qdrant_data:
+  redis_data:
+  prometheus_data:
+  grafana_data:
+
+networks:
+  gefe_network:
+    driver: bridge
