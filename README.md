@@ -98,7 +98,6 @@ make deploy-k8s      # Deploy to Kubernetes
 
 ### 📄 License
 
-Proprietary - ABB Internal Use Only
 
 ### 👥 Contact
 
